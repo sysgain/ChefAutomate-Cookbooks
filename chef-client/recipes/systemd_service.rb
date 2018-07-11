@@ -4,7 +4,7 @@ end
 
 # libraries/helpers.rb method to DRY directory creation resources
 client_bin = find_chef_client
-Chef::Log.debug("Found chef-client in #{client_bin}")
+Chef::Log.debug("Using chef-client binary at #{client_bin}")
 node.default['chef_client']['bin'] = client_bin
 create_chef_directories
 
@@ -13,7 +13,8 @@ dist_dir, conf_dir, env_file = value_for_platform_family(
   ['fedora'] => ['fedora', 'sysconfig', 'chef-client'],
   ['rhel'] => ['redhat', 'sysconfig', 'chef-client'],
   ['suse'] => ['redhat', 'sysconfig', 'chef-client'],
-  ['debian'] => ['debian', 'default', 'chef-client']
+  ['debian'] => ['debian', 'default', 'chef-client'],
+  ['clearlinux'] => ['clearlinux', 'chef', 'chef-client']
 )
 
 timer = node['chef_client']['systemd']['timer']
@@ -24,6 +25,20 @@ exec_options = if timer
                  '-c $CONFIG -i $INTERVAL -s $SPLAY $OPTIONS'
                end
 
+env_file = template "/etc/#{conf_dir}/#{env_file}" do
+  source "#{dist_dir}/#{conf_dir}/chef-client.erb"
+  mode '0644'
+  notifies :restart, 'service[chef-client]', :delayed unless timer
+end
+
+directory '/etc/systemd/system' do
+  owner 'root'
+  group 'root'
+  mode '0755'
+  recursive true
+  action :create
+end
+
 service_unit_content = {
   'Unit' => {
     'Description' => 'Chef Client daemon',
@@ -31,8 +46,8 @@ service_unit_content = {
   },
   'Service' => {
     'Type' => timer ? 'oneshot' : 'simple',
-    'EnvironmentFile' => "/etc/#{conf_dir}/#{env_file}",
-    'ExecStart' => "#{client_bin} #{exec_options}",
+    'EnvironmentFile' => env_file.path,
+    'ExecStart' => "#{client_bin} #{exec_options} #{node['chef_client']['daemon_options'].join(' ')}",
     'ExecReload' => '/bin/kill -HUP $MAINPID',
     'SuccessExitStatus' => 3,
     'Restart' => node['chef_client']['systemd']['restart'],
@@ -42,16 +57,15 @@ service_unit_content = {
 
 service_unit_content['Service'].delete('Restart') if timer
 
+if node['chef_client']['systemd']['timeout']
+  service_unit_content['Service']['TimeoutSec'] =
+    node['chef_client']['systemd']['timeout']
+end
+
 systemd_unit 'chef-client.service' do
   content service_unit_content
   action :create
   notifies(:restart, 'service[chef-client]', :delayed) unless timer
-end
-
-template "/etc/#{conf_dir}/#{env_file}" do
-  source "#{dist_dir}/#{conf_dir}/chef-client.erb"
-  mode '644'
-  notifies :restart, 'service[chef-client]', :delayed unless node['chef_client']['systemd']['timer']
 end
 
 service 'chef-client' do
@@ -66,8 +80,9 @@ systemd_unit 'chef-client.timer' do
     'Timer' => {
       'OnBootSec' => '1min',
       'OnUnitActiveSec' => "#{node['chef_client']['interval']}sec",
-      'AccuracySec' => "#{node['chef_client']['splay']}sec",
+      'RandomizedDelaySec' => "#{node['chef_client']['splay']}sec",
     }
   )
-  action(timer ? [:create, :enable, :start] : [:disable, :delete])
+  action(timer ? [:create, :enable, :start] : [:stop, :disable, :delete])
+  notifies :restart, to_s, :delayed
 end
